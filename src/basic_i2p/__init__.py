@@ -751,14 +751,19 @@ class I2pdManager:
         cmd = [
             str(self._binary),
             "--datadir", str(self._data_dir),
-            "--daemon=false",
+            # No --daemon: i2pd runs in the foreground by default, which is what
+            # we want (we manage it as a subprocess). --daemon is a bare switch,
+            # not a boolean option, so passing it a value is a hard error.
             "--log=file", f"--logfile={self._log_path}", "--loglevel=warn",
-            # I2P-only: no outproxy means a clearnet request fails closed inside
-            # i2pd rather than leaking to an exit.
+            # I2P-only: we never configure an outproxy, so i2pd's HTTP proxy
+            # returns an error for a clearnet host rather than leaking it to an
+            # exit. No outproxy is i2pd's default and we run on a fresh data
+            # dir with no i2pd.conf, so the default holds. (We can't pass
+            # `--httpproxy.outproxy=` to force it — i2pd rejects an empty value
+            # after the equals sign — but the default is exactly what we want.)
             "--httpproxy.enabled=true",
             "--httpproxy.address=127.0.0.1",
             f"--httpproxy.port={self._http_port}",
-            "--httpproxy.outproxy=",
             # SAM drives hosting and P2P sockets; SOCKS is redundant, keep it off.
             "--socksproxy.enabled=false",
             "--sam.enabled=true",
