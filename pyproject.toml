@@ -39,7 +39,7 @@ where = ["src"]
 include = ["basic_i2p*"]
 
 [tool.setuptools.package-data]
-basic_i2p = ["py.typed"]
+basic_i2p = ["py.typed", "certificates/**/*.crt"]
 
 [tool.setuptools.exclude-package-data]
 basic_i2p = ["bin/**"]

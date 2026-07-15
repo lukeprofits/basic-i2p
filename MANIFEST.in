@@ -1,6 +1,7 @@
 include LICENSE
 include README.md
 include SECURITY.md
+recursive-include src/basic_i2p/certificates *.crt
 
 # Defensive: never let an auto-downloaded i2pd binary get pulled into an sdist
 # if a developer has run the package locally.
