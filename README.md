@@ -171,8 +171,9 @@ python your_script.py
 - **Checksums are GPG-verified at authoring time** against the i2pd release-signing key (R4SAS, `951928BB317024EFD053D73C66F6C87B98EBCFE2`), so the baked-in table inherits the project's own signature.
 - **I2P-only, no clearnet leak.** The HTTP proxy has no outproxy, so a clearnet request is refused by the router rather than forwarded. There is no exit path to leak through.
 - **Loopback only.** The HTTP proxy and SAM bridge bind to `127.0.0.1`; the web console and UPnP are disabled. Your destination keys live in a `0700` data directory.
+- **Clean shutdown.** The router is stopped on normal exit, on an unhandled exception, and on `SIGTERM`/`SIGHUP` (`docker stop`, `systemctl stop`, `kill`) — the signal handler chains to any handler you set. The only thing that can orphan i2pd is a `SIGKILL` of your process, which nothing can catch.
 
-See [`SECURITY.md`](SECURITY.md) for the full threat model, including one honest caveat about orphaned processes.
+See [`SECURITY.md`](SECURITY.md) for the full threat model, including the one honest caveat about orphaned processes on `SIGKILL`.
 
 One thing worth knowing: `basic-i2p` gives you I2P's *transport* anonymity. Your application traffic (what you host, what you log in to, what your service reveals about itself) can still identify you — that part is on you.
 

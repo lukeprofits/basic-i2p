@@ -1056,6 +1056,9 @@ class I2PListener:
 _manager: I2pdManager | None = None
 _lock = threading.RLock()
 _atexit_registered = False
+_signals_installed = False
+# Previous dispositions we displaced, so our handler can chain to them.
+_prev_signal_handlers: dict[int, Any] = {}
 
 
 def _ensure_atexit_registered() -> None:
@@ -1063,6 +1066,63 @@ def _ensure_atexit_registered() -> None:
     if not _atexit_registered:
         atexit.register(stop)
         _atexit_registered = True
+    _install_signal_handlers()
+
+
+# Signals whose default disposition terminates the process *without* running
+# atexit — so without a handler here, `kill`, `docker stop`, and `systemctl
+# stop` would all orphan i2pd. (SIGINT is absent on purpose: it raises
+# KeyboardInterrupt, which unwinds through atexit already. SIGKILL is absent
+# because it is uncatchable — see SECURITY.md.)
+def _cleanup_signals() -> list[int]:
+    names = ["SIGTERM", "SIGHUP"]
+    out = []
+    for name in names:
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            out.append(int(sig))
+    return out
+
+
+def _install_signal_handlers() -> None:
+    """Stop i2pd on SIGTERM/SIGHUP, then chain to whatever was there before.
+
+    signal.signal() only works on the main thread; if the first start happens
+    on a worker thread we simply skip this (atexit still covers normal exit).
+    We never clobber a handler silently — the previous disposition is saved and
+    re-invoked, so a caller's own SIGTERM handling still runs.
+    """
+    global _signals_installed
+    if _signals_installed:
+        return
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig in _cleanup_signals():
+        try:
+            prev = signal.signal(sig, _handle_termination_signal)
+        except (ValueError, OSError):
+            continue  # not settable here (e.g. restricted environment)
+        _prev_signal_handlers[sig] = prev
+    _signals_installed = True
+
+
+def _handle_termination_signal(signum: int, frame: Any) -> None:
+    try:
+        stop()
+    finally:
+        prev = _prev_signal_handlers.get(signum, signal.SIG_DFL)
+        # Restore the prior disposition and let it take effect: chain to a
+        # user callback if there was one, otherwise re-deliver so the default
+        # action (terminate) still happens. SIG_IGN means "was ignored" — do
+        # nothing and keep running, matching what the caller asked for.
+        try:
+            signal.signal(signum, prev if prev is not None else signal.SIG_DFL)
+        except (ValueError, OSError):
+            prev = signal.SIG_DFL
+        if callable(prev):
+            prev(signum, frame)
+        elif prev != signal.SIG_IGN:
+            os.kill(os.getpid(), signum)
 
 
 def _get_manager() -> I2pdManager:

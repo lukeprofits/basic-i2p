@@ -84,14 +84,24 @@ answered by i2pd's own error page (HTTP 5xx) — the request never reaches the
 clearnet host and cannot leak to a third-party exit. If you need anonymous
 clearnet access, use a Tor-based tool such as basic-tor instead.
 
-## Known limitation: orphaned router on hard kill
+## Cleanup on exit, and the one case we can't handle
 
-Unlike some daemons, i2pd has no built-in "exit if my parent dies" mechanism
-that survives `SIGKILL`. basic_i2p stops the router cleanly on normal exit
-(explicit `stop()` and an `atexit` handler send `SIGTERM`), but if **your**
-process is `SIGKILL`ed — where `atexit` never runs — the i2pd subprocess can be
-left running until you stop it or reboot. On a shared or long-lived host, that
-is worth knowing. A normal exit, exception, or `SIGTERM` is handled correctly.
+basic_i2p stops the router in every situation it can catch:
+
+- **Normal exit, unhandled exception, or Ctrl-C** — an `atexit` handler runs
+  `stop()`.
+- **`SIGTERM` / `SIGHUP`** (`kill`, `docker stop`, `systemctl stop`) — a signal
+  handler runs `stop()` and then chains to whatever disposition was in place
+  before (a caller's own handler still runs; otherwise the default terminate
+  proceeds). The handler is installed only when the first start happens on the
+  main thread — the only place Python allows it — and it never silently
+  replaces a handler you set.
+
+The **one** case nothing can handle is `SIGKILL` of your process: it is
+uncatchable by design, `atexit` never runs, and i2pd has no "exit if my parent
+dies" mechanism (it exposes only `--pidfile`). If your process is `SIGKILL`ed,
+the i2pd subprocess can be left running until you stop it or reboot. On a
+shared or long-lived host, that is worth knowing.
 
 ## Reporting
 
