@@ -457,29 +457,50 @@ def _safe_member_name(name: str) -> bool:
     return True
 
 
+def _copy_capped(src: Any, out: Any, name: str) -> None:
+    """copyfileobj with a hard cap on bytes written.
+
+    Zip central-directory ``file_size`` is attacker-writable metadata; the only
+    number that counts is how much actually inflates. Same cap either way.
+    """
+    written = 0
+    while True:
+        chunk = src.read(1 << 16)
+        if not chunk:
+            return
+        written += len(chunk)
+        if written > _MAX_MEMBER_BYTES:
+            raise I2PBinaryNotFound(
+                f"Archive member {name!r} inflated past the "
+                f"{_MAX_MEMBER_BYTES}-byte cap — refusing to extract further."
+            )
+        out.write(chunk)
+
+
 def _extract_zip(archive_path: Path, dest_root: Path) -> None:
     dest_root.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive_path) as zf:
         for info in zf.infolist():
-            name = info.filename
-            if name.endswith("/"):
-                continue  # directory entry
+            # Directory entries carry a trailing "/"; validate the path either
+            # way — a hostile dir entry like "../x/" escapes just as surely as
+            # a file would.
+            name = info.filename.rstrip("/\\") if info.is_dir() else info.filename
             if not _safe_member_name(name):
-                raise I2PBinaryNotFound(f"Refusing archive member with unsafe path: {name!r}")
-            if info.file_size > _MAX_MEMBER_BYTES:
+                raise I2PBinaryNotFound(f"Refusing archive member with unsafe path: {info.filename!r}")
+            if not info.is_dir() and info.file_size > _MAX_MEMBER_BYTES:
                 raise I2PBinaryNotFound(
                     f"Archive member {name!r} is {info.file_size} bytes — exceeds the "
                     f"{_MAX_MEMBER_BYTES}-byte cap."
                 )
         for info in zf.infolist():
             name = info.filename
-            if name.endswith("/"):
-                (dest_root / name).mkdir(parents=True, exist_ok=True)
+            if info.is_dir():
+                (dest_root / name.rstrip("/\\")).mkdir(parents=True, exist_ok=True)
                 continue
             target = dest_root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info) as src, open(target, "wb") as out:
-                shutil.copyfileobj(src, out, length=1 << 16)
+                _copy_capped(src, out, name)
 
 
 def _extract_tar(archive_path: Path, dest_root: Path) -> None:
@@ -723,6 +744,13 @@ class I2pdManager:
             return
         self._initialised = False
 
+        # A relaunch (crash recovery, stop→start) gets fresh ports; any session
+        # from the previous router is dead even though its local state still
+        # says open. Drop them so callers get freshly created sessions.
+        for session in self._sessions.values():
+            session.close()
+        self._sessions.clear()
+
         self._binary = _find_or_install_i2pd()
         self._data_dir = _get_data_dir()
         _secure_mkdir(self._data_dir, mode=0o700)
@@ -871,9 +899,21 @@ class I2pdManager:
 
     # ---------------- identity / sessions ----------------
 
+    @staticmethod
+    def _check_name(name: str) -> str:
+        """Identity names become SAM session ids and key filenames — restrict
+        them up front so a bad one fails here with a clear message instead of
+        deep in the SAM layer (or silently colliding key files after
+        sanitisation)."""
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+            raise ValueError(
+                f"invalid identity name {name!r}: use 1-64 characters from "
+                f"letters, digits, '.', '_', '-'"
+            )
+        return name
+
     def _key_path(self, name: str) -> Path:
-        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
-        return _keys_dir() / f"{safe}.dat"
+        return _keys_dir() / f"{self._check_name(name)}.dat"
 
     def _load_keypair(self, name: str) -> tuple[str, str] | None:
         path = self._key_path(name)
@@ -885,12 +925,23 @@ class I2pdManager:
 
     def _save_keypair(self, name: str, pub: str, priv: str) -> None:
         path = self._key_path(name)
-        path.write_text(json.dumps({"pub": pub, "priv": priv}))
-        if os.name == "posix":
+        # 0600 from the first byte (write_text-then-chmod leaves a
+        # umask-readable window on the private key), and tmp+rename so a crash
+        # mid-write can't leave a truncated key that silently rotates the
+        # address next run. The 0700 keys dir is the outer wall; this is the
+        # inner one.
+        tmp = path.with_suffix(".dat.tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(json.dumps({"pub": pub, "priv": priv}))
+            os.replace(tmp, path)
+        except OSError:
             try:
-                os.chmod(path, 0o600)
+                tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+            raise
 
     def _session(self, name: str, persistent: bool) -> SamSession:
         """Return the live STREAM session for ``name``, creating it once.
@@ -899,6 +950,7 @@ class I2pdManager:
         is stable across runs; transient sessions get a fresh key each start.
         """
         assert self._sam_port is not None
+        self._check_name(name)
         existing = self._sessions.get(name)
         if existing is not None and existing.is_open():
             return existing

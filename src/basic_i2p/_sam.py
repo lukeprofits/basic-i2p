@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 import socket
 
 # SAM 3.1 is the newest version both i2pd and Java I2P have supported for
@@ -39,6 +40,25 @@ _I2P_B64_ALTCHARS = b"-~"
 _MIN_DEST_B64_LEN = 516
 
 _MAX_LINE_BYTES = 1 << 16  # SAM reply lines are small; a huge one is hostile.
+
+# SAM commands are "KEY=VALUE" tokens separated by spaces on one line. Any
+# value we interpolate must therefore contain no whitespace or quotes — a
+# space in, say, a naming-lookup name would smuggle an extra KEY=VALUE pair
+# into the command (e.g. a second NAME= that silently redirects the lookup).
+# send_line() already blocks newlines; these pin down the rest per field.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# .i2p / .b32.i2p hostnames plus full base64 destinations (I2P alphabet).
+_LOOKUP_NAME_RE = re.compile(r"^[A-Za-z0-9.\-~=_]{1,4096}$")
+_FORWARD_HOST_RE = re.compile(r"^[A-Za-z0-9.\-:\[\]]{1,255}$")
+
+
+def _require_safe(value: str, pattern: re.Pattern[str], what: str) -> str:
+    if not pattern.match(value):
+        raise SAMError(
+            f"refusing to send unsafe {what} in a SAM command: {value[:80]!r} "
+            f"(must match {pattern.pattern})"
+        )
+    return value
 
 
 class SAMError(RuntimeError):
@@ -267,6 +287,7 @@ def dest_generate(host: str, port: int, timeout: float = 30.0) -> tuple[str, str
 
 def naming_lookup(host: str, port: int, name: str, timeout: float = 30.0) -> str:
     """Resolve a ``.i2p`` / ``.b32.i2p`` name to a base64 destination."""
+    _require_safe(name, _LOOKUP_NAME_RE, "lookup name")
     with SamConnection(host, port, timeout) as conn:
         reply = conn.command(f"NAMING LOOKUP NAME={name}", expect="NAMING REPLY")
         if reply.get("RESULT") != "OK":
@@ -297,7 +318,7 @@ class SamSession:
         self._timeout = timeout
         self._create_timeout = create_timeout
         self._options = dict(options or {})
-        self.session_id = session_id
+        self.session_id = _require_safe(session_id, _SESSION_ID_RE, "session id")
         # pub+priv are either both given (persistent, loaded from disk) or both
         # None (generated in create()). We never mix.
         self.destination = pub_b64 or ""  # public dest b64
@@ -320,6 +341,10 @@ class SamSession:
             self.destination, self._priv = dest_generate(
                 self._host, self._port, self._timeout
             )
+        # A keypair loaded from disk is data, not code: if the file was
+        # corrupted or tampered into containing whitespace, refuse to splice
+        # it into the command line.
+        _require_safe(self._priv, _LOOKUP_NAME_RE, "private destination")
         conn = SamConnection(self._host, self._port, self._timeout)
         conn.connect()
         try:
@@ -327,6 +352,7 @@ class SamSession:
                 f"SESSION CREATE STYLE=STREAM ID={self.session_id} DESTINATION={self._priv}",
             ]
             for k, v in self._options.items():
+                _require_safe(f"{k}{v}", _LOOKUP_NAME_RE, "session option")
                 parts.append(f"{k}={v}")
             # Tunnel build happens inside this call — allow it session-create time.
             reply = conn.command(" ".join(parts), expect="SESSION STATUS",
@@ -398,8 +424,12 @@ class SamSession:
             raise
         remote_dest = first.split()[0] if first.split() else ""
         sock, pending = conn.detach()
+        try:
+            remote = b32_address(remote_dest) if remote_dest else ""
+        except SAMError:
+            sock.close()
+            raise
         sock.settimeout(None)
-        remote = b32_address(remote_dest) if remote_dest else ""
         return I2PSocket(sock, pending, remote=remote)
 
     def forward(self, port: int, host: str = "127.0.0.1") -> None:
@@ -410,6 +440,8 @@ class SamSession:
         Forwarding stays active while this session lives.
         """
         self._require_created()
+        _require_safe(host, _FORWARD_HOST_RE, "forward host")
+        port = int(port)
         conn = SamConnection(self._host, self._port, self._timeout)
         conn.connect()
         try:

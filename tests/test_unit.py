@@ -179,6 +179,26 @@ def test_extract_zip_rejects_traversal(tmp_path):
         _extract_zip(archive, tmp_path / "out")
 
 
+def test_extract_zip_rejects_traversal_dir_entry(tmp_path):
+    # Directory entries (trailing "/") escape the tree just as surely as files.
+    archive = tmp_path / "evil.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("../outside/", b"")
+    with pytest.raises(I2PBinaryNotFound):
+        _extract_zip(archive, tmp_path / "out")
+    assert not (tmp_path / "outside").exists()
+
+
+def test_copy_capped_binds_on_actual_bytes(monkeypatch):
+    # Archive size metadata is attacker-writable; the cap must bind on bytes
+    # actually produced by the decompressor, not on declared size.
+    import basic_i2p as pkg
+    from basic_i2p import _copy_capped
+    monkeypatch.setattr(pkg, "_MAX_MEMBER_BYTES", 16)
+    with pytest.raises(I2PBinaryNotFound):
+        _copy_capped(io.BytesIO(b"x" * 64), io.BytesIO(), "member")
+
+
 def test_extract_tar_rejects_symlink(tmp_path):
     archive = tmp_path / "evil.tar.gz"
     with tarfile.open(archive, "w:gz") as tf:
@@ -214,6 +234,36 @@ def test_extract_tar_roundtrip(tmp_path):
     extracted = out / "i2pd"
     assert extracted.read_bytes() == data
     assert extracted.stat().st_mode & 0o100  # exec bit preserved
+
+
+# ---------------------------------------------------------------------------
+# Identity names + key storage
+# ---------------------------------------------------------------------------
+
+
+def test_identity_name_rejects_unsafe(tmp_path, monkeypatch):
+    from basic_i2p import I2pdManager
+    mgr = I2pdManager()
+    for bad in ("a b", "x\nY", "", "a" * 65, 'q"q', "über"):
+        with pytest.raises(ValueError):
+            mgr._key_path(bad)
+    assert mgr._key_path("my-app.v2").name == "my-app.v2.dat"
+
+
+def test_save_keypair_mode_0600(tmp_path, monkeypatch):
+    import os
+    if os.name != "posix":
+        pytest.skip("POSIX permissions only")
+    import basic_i2p as pkg
+    from basic_i2p import I2pdManager, _keys_dir
+    monkeypatch.setattr(pkg, "DATA_DIR", tmp_path)
+    _keys_dir().mkdir(parents=True)
+    mgr = I2pdManager()
+    mgr._save_keypair("default", "PUB", "PRIV")
+    path = mgr._key_path("default")
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert mgr._load_keypair("default") == ("PUB", "PRIV")
+    assert not path.with_suffix(".dat.tmp").exists()
 
 
 # ---------------------------------------------------------------------------

@@ -277,3 +277,49 @@ def test_connect_resolves_name_first(sam):
     assert sock.remote.endswith(".b32.i2p")
     sock.close()
     s.close()
+
+
+# ---------------------------------------------------------------------------
+# SAM command injection — values we splice into command lines must not be able
+# to smuggle extra KEY=VALUE tokens (space) or extra commands (newline).
+# ---------------------------------------------------------------------------
+
+
+def test_naming_lookup_rejects_injection(sam):
+    # A second NAME= token would silently redirect the lookup.
+    with pytest.raises(SAMError):
+        naming_lookup("127.0.0.1", sam.port, "x.i2p NAME=evil.i2p")
+    with pytest.raises(SAMError):
+        naming_lookup("127.0.0.1", sam.port, 'x.i2p"')
+
+
+def test_session_id_rejects_injection():
+    # Session ids ride on SESSION CREATE next to DESTINATION= — a space could
+    # inject tunnel options (e.g. inbound.length=0).
+    with pytest.raises(SAMError):
+        SamSession("127.0.0.1", 1, session_id="x inbound.length=0")
+
+
+def test_session_options_reject_injection(sam):
+    s = SamSession("127.0.0.1", sam.port, session_id="h",
+                   options={"inbound.length": "3 outbound.length=0"})
+    with pytest.raises(SAMError):
+        s.create()
+
+
+def test_forward_rejects_injection(sam):
+    s = SamSession("127.0.0.1", sam.port, session_id="i")
+    s.create()
+    with pytest.raises(SAMError):
+        s.forward(8080, host="127.0.0.1 SILENT=false")
+    with pytest.raises((SAMError, ValueError, TypeError)):
+        s.forward("80 HOST=evil")  # type: ignore[arg-type]
+    s.close()
+
+
+def test_create_rejects_tampered_private_key(sam):
+    # A keypair file tampered to contain whitespace must not reach the wire.
+    s = SamSession("127.0.0.1", sam.port, session_id="j",
+                   pub_b64=_make_dest(3), priv_b64=_make_dest(3) + " EXTRA=1")
+    with pytest.raises(SAMError):
+        s.create()
