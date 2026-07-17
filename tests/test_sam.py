@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import socket
 import threading
+import time
 
 import pytest
 
@@ -41,7 +42,8 @@ class FakeSam:
 
     #: name → destination that NAMING LOOKUP should resolve. "ME" is special.
     def __init__(self, fail_connect_to: str | None = None,
-                 unresolvable: set[str] | None = None) -> None:
+                 unresolvable: set[str] | None = None,
+                 accept_delay: float = 0.0) -> None:
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind(("127.0.0.1", 0))
@@ -51,6 +53,7 @@ class FakeSam:
         self._stop = False
         self._fail_connect_to = fail_connect_to
         self._unresolvable = unresolvable or set()
+        self._accept_delay = accept_delay
         # A pending inbound peer for STREAM ACCEPT to hand back.
         self.incoming_remote = _make_dest(99)
         self._accept_thread = threading.Thread(target=self._serve, daemon=True)
@@ -112,6 +115,8 @@ class FakeSam:
                 elif line.startswith("STREAM ACCEPT"):
                     conn.sendall(b"STREAM STATUS RESULT=OK\n")
                     # Simulate a peer arriving: send its destination line, then pipe.
+                    if self._accept_delay:
+                        time.sleep(self._accept_delay)
                     conn.sendall(f"{self.incoming_remote}\n".encode())
                     self._echo_pipe(conn, buf)
                     return
@@ -269,6 +274,49 @@ def test_forward_keeps_session_open(sam):
     s.close()
 
 
+def test_forward_is_idempotent(sam):
+    # Re-forwarding the same host:port must be a no-op — a second STREAM
+    # FORWARD for the same target would pile up connections (and i2pd may
+    # refuse it), breaking an idempotent-looking host_service() call.
+    s = SamSession("127.0.0.1", sam.port, session_id="f2")
+    s.create()
+    s.forward(8080)
+    s.forward(8080)
+    assert len(s._forwards) == 1
+    s.forward(8081)  # a different port is a genuine new forward
+    assert len(s._forwards) == 2
+    s.close()
+
+
+def test_accept_blocks_past_protocol_timeout():
+    # accept(timeout=None) must wait indefinitely for a peer — the
+    # connection's protocol timeout (here shrunk to 0.2s) must not apply to
+    # the peer wait. Regression: it used to leak through and kill accept()
+    # after 30s.
+    server = FakeSam(accept_delay=0.6)
+    try:
+        s = SamSession("127.0.0.1", server.port, session_id="slow", timeout=0.2)
+        s.create()
+        conn = s.accept(timeout=None)
+        assert conn.remote == b32_address(server.incoming_remote)
+        conn.close()
+        s.close()
+    finally:
+        server.close()
+
+
+def test_accept_honours_explicit_timeout():
+    server = FakeSam(accept_delay=5.0)
+    try:
+        s = SamSession("127.0.0.1", server.port, session_id="slow2")
+        s.create()
+        with pytest.raises(socket.timeout):  # TimeoutError alias on 3.10+
+            s.accept(timeout=0.2)
+        s.close()
+    finally:
+        server.close()
+
+
 def test_connect_resolves_name_first(sam):
     # A .i2p name is not a literal dest, so connect() must NAMING LOOKUP it.
     s = SamSession("127.0.0.1", sam.port, session_id="g")
@@ -315,6 +363,30 @@ def test_forward_rejects_injection(sam):
     with pytest.raises((SAMError, ValueError, TypeError)):
         s.forward("80 HOST=evil")  # type: ignore[arg-type]
     s.close()
+
+
+def test_session_kind_mismatch_raises(sam, tmp_path, monkeypatch):
+    # Asking for a transient identity under a name already open as persistent
+    # (or vice versa) must fail loudly — silently returning the cached session
+    # would hand back a linkable identity to a caller who asked for a fresh,
+    # unlinkable one.
+    import basic_i2p
+    monkeypatch.setattr(basic_i2p, "DATA_DIR", tmp_path)
+    basic_i2p._keys_dir().mkdir(parents=True)
+    mgr = basic_i2p.I2pdManager()
+    mgr._sam_port = sam.port
+
+    first = mgr.open_session("app", persistent=True)
+    assert mgr.open_session("app", persistent=True) is first  # same kind: cached
+    with pytest.raises(ValueError) as exc:
+        mgr.open_session("app", persistent=False)
+    assert "persistent" in str(exc.value)
+    # A different name is fine, and tracks its own kind.
+    mgr.open_session("other", persistent=False)
+    with pytest.raises(ValueError):
+        mgr.open_session("other", persistent=True)
+    for s in mgr._sessions.values():
+        s.close()
 
 
 def test_create_rejects_tampered_private_key(sam):

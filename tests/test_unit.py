@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import base64
 import io
+import os as _os
+import socket as _socket
 import tarfile
 import zipfile
 from unittest import mock
@@ -189,14 +191,50 @@ def test_extract_zip_rejects_traversal_dir_entry(tmp_path):
     assert not (tmp_path / "outside").exists()
 
 
-def test_copy_capped_binds_on_actual_bytes(monkeypatch):
+def test_copy_capped_binds_on_actual_bytes():
     # Archive size metadata is attacker-writable; the cap must bind on bytes
     # actually produced by the decompressor, not on declared size.
-    import basic_i2p as pkg
     from basic_i2p import _copy_capped
-    monkeypatch.setattr(pkg, "_MAX_MEMBER_BYTES", 16)
     with pytest.raises(I2PBinaryNotFound):
-        _copy_capped(io.BytesIO(b"x" * 64), io.BytesIO(), "member")
+        _copy_capped(io.BytesIO(b"x" * 64), io.BytesIO(), "member", cap=16)
+    assert _copy_capped(io.BytesIO(b"x" * 8), io.BytesIO(), "member", cap=16) == 8
+
+
+def test_extract_zip_rejects_too_many_members(tmp_path, monkeypatch):
+    import basic_i2p as pkg
+    monkeypatch.setattr(pkg, "_MAX_MEMBERS", 2)
+    archive = tmp_path / "many.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for i in range(3):
+            zf.writestr(f"f{i}", b"x")
+    with pytest.raises(I2PBinaryNotFound):
+        _extract_zip(archive, tmp_path / "out")
+
+
+def test_extract_tar_rejects_too_many_members(tmp_path, monkeypatch):
+    import basic_i2p as pkg
+    monkeypatch.setattr(pkg, "_MAX_MEMBERS", 2)
+    archive = tmp_path / "many.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        for i in range(3):
+            info = tarfile.TarInfo(f"f{i}")
+            info.size = 1
+            tf.addfile(info, io.BytesIO(b"x"))
+    with pytest.raises(I2PBinaryNotFound):
+        _extract_tar(archive, tmp_path / "out")
+
+
+def test_extract_zip_total_bytes_cap(tmp_path, monkeypatch):
+    # Many members each under the per-member cap must still trip the
+    # whole-archive budget.
+    import basic_i2p as pkg
+    monkeypatch.setattr(pkg, "_MAX_TOTAL_BYTES", 24)
+    archive = tmp_path / "fat.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for i in range(3):
+            zf.writestr(f"f{i}", b"x" * 10)
+    with pytest.raises(I2PBinaryNotFound):
+        _extract_zip(archive, tmp_path / "out")
 
 
 def test_extract_tar_rejects_symlink(tmp_path):
@@ -234,6 +272,57 @@ def test_extract_tar_roundtrip(tmp_path):
     extracted = out / "i2pd"
     assert extracted.read_bytes() == data
     assert extracted.stat().st_mode & 0o100  # exec bit preserved
+
+
+# ---------------------------------------------------------------------------
+# Loopback port ownership (anti-impersonation check, Linux only)
+# ---------------------------------------------------------------------------
+
+
+linux_proc = pytest.mark.skipif(
+    not _os.path.exists("/proc/net/tcp"), reason="needs Linux /proc"
+)
+
+
+@linux_proc
+def test_verify_port_owner_true_for_own_listener():
+    from basic_i2p import _verify_port_owner
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+        assert _verify_port_owner(port, _os.getpid()) is True
+
+
+@linux_proc
+def test_verify_port_owner_false_for_foreign_listener():
+    # Model the attack: the port's listener (here: us, playing the hostile
+    # process) is NOT the child we launched. Checked against a real child
+    # whose /proc/<pid>/fd we can read, this must be a definite False.
+    import subprocess
+    import sys
+
+    from basic_i2p import _verify_port_owner
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            s.listen(1)
+            port = s.getsockname()[1]
+            assert _verify_port_owner(port, child.pid) is False
+    finally:
+        child.kill()
+        child.wait()
+
+
+@linux_proc
+def test_verify_port_owner_indeterminate_without_listener():
+    from basic_i2p import _verify_port_owner
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    # Port now closed — no listener → indeterminate, never a hard failure.
+    assert _verify_port_owner(port, _os.getpid()) is None
 
 
 # ---------------------------------------------------------------------------

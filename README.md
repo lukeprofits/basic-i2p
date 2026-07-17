@@ -78,7 +78,7 @@ That's the whole API. `start()` also exists as an alias for `ensure_running()` i
 
 First bootstrap takes roughly **1–5 minutes** (reseeding, then building tunnels through the I2P network) — noticeably slower than Tor, so be patient on the first call. Later runs reuse the cached netdb and start faster. `ensure_running()` is idempotent — call it as often as you like.
 
-**Identities are persistent by default.** Your `.i2p` address is derived from a keypair saved in the data directory, so a service you `host_service()` keeps the **same address across restarts**. Pass `persistent=False` to any of `host_service` / `connect` / `listen` / `my_destination` for a fresh, unlinkable identity each run. Use `name="…"` to keep multiple separate identities.
+**Identities are persistent by default.** Your `.i2p` address is derived from a keypair saved in the data directory, so a service you `host_service()` keeps the **same address across restarts**. Pass `persistent=False` to any of `host_service` / `connect` / `listen` / `my_destination` for a fresh, unlinkable identity each run. Use `name="…"` to keep multiple separate identities. A `name` keeps the kind it was first opened with — asking for the same name as persistent in one call and transient in another raises `ValueError` rather than silently reusing the wrong identity.
 
 All failures raise `basic_i2p.I2PError`. Subclasses, all with actionable messages:
 
@@ -171,6 +171,7 @@ python your_script.py
 - **Checksums are GPG-verified at authoring time** against the i2pd release-signing key (R4SAS, `951928BB317024EFD053D73C66F6C87B98EBCFE2`), so the baked-in table inherits the project's own signature.
 - **I2P-only, no clearnet leak.** The HTTP proxy has no outproxy, so a clearnet request is refused by the router rather than forwarded. There is no exit path to leak through.
 - **Loopback only.** The HTTP proxy and SAM bridge bind to `127.0.0.1`; the web console and UPnP are disabled. Your destination keys live in a `0700` data directory.
+- **Hardened against local attackers.** SAM session ids are unguessable (no session hijack by other local processes), and on Linux the SAM/proxy ports are verified to belong to the i2pd we launched before any key material crosses them — a locally impersonated bridge fails closed. See [`SECURITY.md`](SECURITY.md) for the shared-host details.
 - **Clean shutdown.** The router is stopped on normal exit, on an unhandled exception, and on `SIGTERM`/`SIGHUP` (`docker stop`, `systemctl stop`, `kill`) — the signal handler chains to any handler you set. The only thing that can orphan i2pd is a `SIGKILL` of your process, which nothing can catch.
 
 See [`SECURITY.md`](SECURITY.md) for the full threat model, including the one honest caveat about orphaned processes on `SIGKILL`.

@@ -75,6 +75,38 @@ are public and carry no secret material.
 - Destination private keys (the keys behind your `.i2p` addresses) are stored
   `0600` inside the `0700` data directory.
 
+## Local attackers (shared hosts)
+
+Loopback services are reachable by **every local user**, and i2pd offers no
+authentication on its HTTP proxy or SAM bridge. What that means here, and what
+we do about it:
+
+- **Session hijack — mitigated.** SAM authenticates stream commands by session
+  id alone. Ours are generated with `secrets` (unguessable), so another local
+  process cannot attach `STREAM CONNECT`/`ACCEPT`/`FORWARD` to your identity by
+  predicting the id.
+- **Bridge impersonation via the port-bind race — verified on Linux.** Ports
+  are probed as free before i2pd launches; a hostile local process could win
+  that race and pose as the SAM bridge — and a `SESSION CREATE` against a fake
+  bridge would hand it your destination private key. Before any session is
+  created, we check via `/proc` that the listener on the SAM and proxy ports
+  belongs to the i2pd process we launched, and **fail closed on a mismatch**.
+  On Windows/macOS this check is not available; the race window there is the
+  few hundred milliseconds between the port probe and i2pd's bind. If that
+  residual window matters to you, pin `SAM_PORT`/`HTTP_PROXY_PORT` to ports you
+  control by other means, or run inside an OS-level sandbox/container.
+- **Dead-listener squatting — refused.** If the router dies, its ports are
+  freed and could be re-bound by another local process. Listeners created by
+  `listen()` check router liveness before each `accept()` and refuse to dial a
+  port our router no longer owns; the module-level API re-checks liveness on
+  every call.
+- **Router use by other local users — not preventable.** Any local process can
+  use the HTTP proxy to fetch `.i2p` sites through your router, or open its own
+  SAM sessions (with their own keys) on it. i2pd has no auth knob for these;
+  this affects any local i2pd, not just ours. It does not expose your keys or
+  your sessions. On a multi-user host where this matters, isolate the process
+  (container, dedicated user, network namespace).
+
 ## I2P-only — no clearnet exit
 
 I2P is not an exit network, and basic_i2p does not turn it into one. The HTTP

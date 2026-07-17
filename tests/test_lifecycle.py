@@ -9,6 +9,7 @@ i2pd on Linux). They are skipped automatically if no i2pd can be found.
 from __future__ import annotations
 
 import http.server
+import shutil
 import threading
 
 import pytest
@@ -20,11 +21,14 @@ pytestmark = pytest.mark.network
 
 
 def _i2pd_available() -> bool:
+    """Cheap availability probe — runs at collection time (skipif is evaluated
+    even when network tests are deselected), so it must never trigger the
+    auto-download. The download itself happens inside the tests."""
     try:
-        basic_i2p._find_or_install_i2pd()
-        return True
+        basic_i2p._platform_key()
+        return True  # static build exists: cached already or downloadable in-test
     except basic_i2p.I2PBinaryNotFound:
-        return False
+        return basic_i2p._manual_binary_path().exists() or shutil.which("i2pd") is not None
 
 
 requires_i2pd = pytest.mark.skipif(

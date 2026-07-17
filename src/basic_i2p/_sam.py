@@ -251,10 +251,13 @@ class SamConnection:
             raise SAMError(f"SAM command must be a single line: {line!r}")
         self._sock.sendall(line.encode("utf-8") + b"\n")
 
-    def read_line(self, timeout: float | None = None) -> str:
-        if timeout is not None:
-            assert self._sock is not None
-            self._sock.settimeout(timeout)
+    def set_timeout(self, value: float | None) -> None:
+        """Socket timeout for subsequent reads. ``None`` blocks forever."""
+        if self._sock is None:
+            raise SAMError("SAM connection is not open")
+        self._sock.settimeout(value)
+
+    def read_line(self) -> str:
         while b"\n" not in self._buf:
             assert self._sock is not None
             chunk = self._sock.recv(4096)
@@ -325,6 +328,7 @@ class SamSession:
         self._priv = priv_b64
         self._control: SamConnection | None = None
         self._forwards: list[SamConnection] = []
+        self._forward_addrs: set[tuple[str, int]] = set()
 
     @property
     def b32(self) -> str:
@@ -402,7 +406,11 @@ class SamSession:
         return I2PSocket(sock, pending, remote=b32_address(dest))
 
     def accept(self, timeout: float | None = None) -> I2PSocket:
-        """Block until a peer connects; returns the stream (``.remote`` = their b32)."""
+        """Block until a peer connects; returns the stream (``.remote`` = their b32).
+
+        ``timeout=None`` waits indefinitely; a number raises ``socket.timeout``
+        (``TimeoutError`` on 3.10+) if no peer dials within that many seconds.
+        """
         self._require_created()
         conn = SamConnection(self._host, self._port, self._timeout)
         conn.connect()
@@ -418,7 +426,10 @@ class SamSession:
                 )
             # Now the bridge holds the socket until a peer arrives, then sends
             # one line: the remote destination (3.2+ appends FROM_PORT/TO_PORT).
-            first = conn.read_line(timeout=timeout)
+            # The wait is unbounded unless the caller asked otherwise — the
+            # connection's protocol timeout must not apply here.
+            conn.set_timeout(timeout)
+            first = conn.read_line()
         except BaseException:
             conn.close()
             raise
@@ -437,11 +448,14 @@ class SamSession:
 
         SILENT=true so the forwarded connection carries only payload bytes —
         the local server (e.g. your HTTP app) never sees the SAM header line.
-        Forwarding stays active while this session lives.
+        Forwarding stays active while this session lives. Re-forwarding the
+        same ``host:port`` is a no-op, so callers can be idempotent.
         """
         self._require_created()
         _require_safe(host, _FORWARD_HOST_RE, "forward host")
         port = int(port)
+        if (host, port) in self._forward_addrs:
+            return
         conn = SamConnection(self._host, self._port, self._timeout)
         conn.connect()
         try:
@@ -459,6 +473,7 @@ class SamSession:
             raise
         # The forward lives as long as this socket — keep it open.
         self._forwards.append(conn)
+        self._forward_addrs.add((host, port))
 
     def is_open(self) -> bool:
         return self._control is not None
@@ -467,6 +482,7 @@ class SamSession:
         for fwd in self._forwards:
             fwd.close()
         self._forwards.clear()
+        self._forward_addrs.clear()
         if self._control is not None:
             self._control.close()
             self._control = None

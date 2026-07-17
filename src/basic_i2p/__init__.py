@@ -48,6 +48,7 @@ import logging
 import os
 import platform
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -59,7 +60,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, NoReturn
+from typing import Any, Callable, NoReturn
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -289,8 +290,13 @@ def _keys_dir() -> Path:
 _VERSION_RE = re.compile(r"^\d+\.\d+(\.\d+)?$")
 
 # Hardening caps for extraction. Real archives are well under 20 MB extracted
-# across a shallow tree; anything materially larger or deeper is suspect.
+# across a shallow tree of a few dozen files; anything materially larger,
+# deeper, or more numerous is suspect. The SHA-512 gate runs before extraction,
+# so these are defence-in-depth — they bound the damage if that gate is ever
+# bypassed or misconfigured.
 _MAX_MEMBER_BYTES = 128 * 1024 * 1024
+_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+_MAX_MEMBERS = 4096
 _MAX_PATH_DEPTH = 8
 _MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 
@@ -457,22 +463,23 @@ def _safe_member_name(name: str) -> bool:
     return True
 
 
-def _copy_capped(src: Any, out: Any, name: str) -> None:
-    """copyfileobj with a hard cap on bytes written.
+def _copy_capped(src: Any, out: Any, name: str, cap: int) -> int:
+    """copyfileobj with a hard cap on bytes written; returns bytes written.
 
     Zip central-directory ``file_size`` is attacker-writable metadata; the only
-    number that counts is how much actually inflates. Same cap either way.
+    number that counts is how much actually inflates. ``cap`` is the smaller of
+    the per-member cap and whatever remains of the whole-archive budget.
     """
     written = 0
     while True:
         chunk = src.read(1 << 16)
         if not chunk:
-            return
+            return written
         written += len(chunk)
-        if written > _MAX_MEMBER_BYTES:
+        if written > cap:
             raise I2PBinaryNotFound(
                 f"Archive member {name!r} inflated past the "
-                f"{_MAX_MEMBER_BYTES}-byte cap — refusing to extract further."
+                f"{cap}-byte cap — refusing to extract further."
             )
         out.write(chunk)
 
@@ -480,7 +487,12 @@ def _copy_capped(src: Any, out: Any, name: str) -> None:
 def _extract_zip(archive_path: Path, dest_root: Path) -> None:
     dest_root.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive_path) as zf:
-        for info in zf.infolist():
+        infos = zf.infolist()
+        if len(infos) > _MAX_MEMBERS:
+            raise I2PBinaryNotFound(
+                f"Archive has {len(infos)} members — exceeds the {_MAX_MEMBERS} cap."
+            )
+        for info in infos:
             # Directory entries carry a trailing "/"; validate the path either
             # way — a hostile dir entry like "../x/" escapes just as surely as
             # a file would.
@@ -492,7 +504,8 @@ def _extract_zip(archive_path: Path, dest_root: Path) -> None:
                     f"Archive member {name!r} is {info.file_size} bytes — exceeds the "
                     f"{_MAX_MEMBER_BYTES}-byte cap."
                 )
-        for info in zf.infolist():
+        total = 0
+        for info in infos:
             name = info.filename
             if info.is_dir():
                 (dest_root / name.rstrip("/\\")).mkdir(parents=True, exist_ok=True)
@@ -500,13 +513,19 @@ def _extract_zip(archive_path: Path, dest_root: Path) -> None:
             target = dest_root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info) as src, open(target, "wb") as out:
-                _copy_capped(src, out, name)
+                total += _copy_capped(
+                    src, out, name, min(_MAX_MEMBER_BYTES, _MAX_TOTAL_BYTES - total)
+                )
 
 
 def _extract_tar(archive_path: Path, dest_root: Path) -> None:
     dest_root.mkdir(parents=True, exist_ok=True)
     with tarfile.open(str(archive_path), mode="r:gz") as tf:
         members = tf.getmembers()
+        if len(members) > _MAX_MEMBERS:
+            raise I2PBinaryNotFound(
+                f"Archive has {len(members)} members — exceeds the {_MAX_MEMBERS} cap."
+            )
         for m in members:
             if not (m.isfile() or m.isdir()):
                 raise I2PBinaryNotFound(
@@ -520,6 +539,7 @@ def _extract_tar(archive_path: Path, dest_root: Path) -> None:
                     f"Archive member {m.name!r} is {m.size} bytes — exceeds the "
                     f"{_MAX_MEMBER_BYTES}-byte cap."
                 )
+        total = 0
         for m in members:
             target = dest_root / m.name
             if m.isdir():
@@ -529,8 +549,12 @@ def _extract_tar(archive_path: Path, dest_root: Path) -> None:
             src = tf.extractfile(m)
             if src is None:
                 continue
+            # Cap on bytes actually produced, not the header's size field —
+            # same rule as the zip path.
             with src, open(target, "wb") as out:
-                shutil.copyfileobj(src, out, length=1 << 16)
+                total += _copy_capped(
+                    src, out, m.name, min(_MAX_MEMBER_BYTES, _MAX_TOTAL_BYTES - total)
+                )
             if m.mode & 0o111:
                 target.chmod(target.stat().st_mode | stat.S_IXUSR)
 
@@ -717,6 +741,66 @@ def _free_tcp_port() -> int:
         return s.getsockname()[1]
 
 
+def _listener_inodes(port: int) -> set[str] | None:
+    """Socket inodes of LISTEN sockets on ``port``, from /proc/net/tcp{,6}.
+
+    Returns None where /proc isn't available (non-Linux) — the caller treats
+    that as indeterminate, never as failure.
+    """
+    inodes: set[str] = set()
+    readable = False
+    for name in ("tcp", "tcp6"):
+        try:
+            text = Path(f"/proc/net/{name}").read_text()
+        except OSError:
+            continue
+        readable = True
+        for line in text.splitlines()[1:]:
+            parts = line.split()
+            # local_address is "HEXADDR:HEXPORT"; st 0A is LISTEN; col 9 is inode.
+            if len(parts) < 10 or parts[3] != "0A":
+                continue
+            _, _, port_hex = parts[1].partition(":")
+            try:
+                if int(port_hex, 16) == port:
+                    inodes.add(parts[9])
+            except ValueError:
+                continue
+    return inodes if readable else None
+
+
+def _pid_owns_any_inode(pid: int, inodes: set[str]) -> bool | None:
+    """Whether process ``pid`` holds any of the given socket inodes among its
+    fds. None if /proc/<pid>/fd can't be read (gone, or no permission)."""
+    fd_dir = Path(f"/proc/{pid}/fd")
+    try:
+        entries = list(fd_dir.iterdir())
+    except OSError:
+        return None
+    held = set()
+    for fd in entries:
+        try:
+            held.add(os.readlink(str(fd)))
+        except OSError:
+            continue
+    return any(f"socket:[{inode}]" in held for inode in inodes)
+
+
+def _verify_port_owner(port: int, pid: int) -> bool | None:
+    """Best-effort check that the listener on loopback ``port`` is process
+    ``pid``. True/False when determinable (Linux), None otherwise.
+
+    Why: ports are probed as free before i2pd launches, so a hostile local
+    process could win the bind race and impersonate the SAM bridge — and a
+    SESSION CREATE against a fake bridge would hand it the destination
+    private key. Positive mismatch must therefore fail closed.
+    """
+    inodes = _listener_inodes(port)
+    if inodes is None or not inodes:
+        return None  # non-Linux, or listener not visible yet — indeterminate
+    return _pid_owns_any_inode(pid, inodes)
+
+
 # ---------------------------------------------------------------------------
 # I2pdManager — process-singleton router lifecycle + SAM sessions
 # ---------------------------------------------------------------------------
@@ -733,6 +817,9 @@ class I2pdManager:
         self._http_port: int | None = None
         self._sam_port: int | None = None
         self._sessions: dict[str, SamSession] = {}
+        # name → persistent flag it was opened with; a later call asking for
+        # the other kind must fail, not silently hand back the wrong identity.
+        self._session_kinds: dict[str, bool] = {}
         self._initialised = False
 
     # ---------------- startup ----------------
@@ -750,6 +837,7 @@ class I2pdManager:
         for session in self._sessions.values():
             session.close()
         self._sessions.clear()
+        self._session_kinds.clear()
 
         self._binary = _find_or_install_i2pd()
         self._data_dir = _get_data_dir()
@@ -837,12 +925,21 @@ class I2pdManager:
                 f"See log: {self._log_path}"
             )
 
-        # 2) Wait for a probe STREAM session (transient) to build tunnels.
+        # 2) Before anything sensitive crosses these ports, make sure they are
+        # actually served by *our* i2pd. The free-port probe races the bind: a
+        # hostile local process that wins it could impersonate the SAM bridge
+        # (and receive destination private keys) or the HTTP proxy (and read
+        # or spoof proxied traffic). Only determinable on Linux; a positive
+        # mismatch is a hard stop.
+        self._verify_ports_owned()
+
+        # 3) Wait for a probe STREAM session (transient) to build tunnels.
         while time.monotonic() < deadline:
             self._check_alive()
             remaining = max(1.0, deadline - time.monotonic())
             probe = SamSession(
-                "127.0.0.1", self._sam_port, session_id=f"basic-i2p-probe-{os.getpid()}",
+                "127.0.0.1", self._sam_port,
+                session_id=f"basic-i2p-probe-{secrets.token_urlsafe(9)}",
                 timeout=30.0, create_timeout=remaining,
             )
             try:
@@ -859,6 +956,21 @@ class I2pdManager:
             f"i2pd did not finish building tunnels within {timeout:.0f}s. "
             f"Network may be blocking I2P. See log: {self._log_path}"
         )
+
+    def _verify_ports_owned(self) -> None:
+        assert self._process is not None
+        pid = self._process.pid
+        for label, port in (("SAM bridge", self._sam_port),
+                            ("HTTP proxy", self._http_port)):
+            if port is None:
+                continue
+            if _verify_port_owner(port, pid) is False:
+                raise I2PError(
+                    f"The {label} port 127.0.0.1:{port} is served by a process "
+                    f"other than the i2pd we launched (pid {pid}). Refusing to "
+                    f"use it — a local process may be impersonating the router. "
+                    f"Stop whatever holds that port, or pin a different port."
+                )
 
     def _sam_hello_ok(self) -> bool:
         assert self._sam_port is not None
@@ -953,6 +1065,14 @@ class I2pdManager:
         self._check_name(name)
         existing = self._sessions.get(name)
         if existing is not None and existing.is_open():
+            if self._session_kinds.get(name) != persistent:
+                have = "persistent" if self._session_kinds.get(name) else "transient"
+                want = "persistent" if persistent else "transient"
+                raise ValueError(
+                    f"identity {name!r} is already open as a {have} session in "
+                    f"this process; asking for a {want} one would silently hand "
+                    f"back the wrong identity. Use a different name."
+                )
             return existing
 
         pub = priv = None
@@ -961,15 +1081,20 @@ class I2pdManager:
             if loaded is not None:
                 pub, priv = loaded
 
+        # The session id is a capability: SAM's STREAM CONNECT/ACCEPT/FORWARD
+        # authenticate by id alone, and the bridge has no user auth. A
+        # predictable id (name + pid) would let any local process attach
+        # streams to this identity — so make it unguessable.
         session = SamSession(
             "127.0.0.1", self._sam_port,
-            session_id=f"basic-i2p-{name}-{os.getpid()}",
+            session_id=f"basic-i2p-{name}-{secrets.token_urlsafe(9)}",
             pub_b64=pub, priv_b64=priv,
         )
         session.create()
         if persistent:
             self._save_keypair(name, session.destination, session.private_key)
         self._sessions[name] = session
+        self._session_kinds[name] = persistent
         return session
 
     def my_destination(self, name: str, persistent: bool) -> str:
@@ -980,11 +1105,6 @@ class I2pdManager:
         session = self._session(name, persistent)
         session.forward(local_port, host=local_host)
         return session.b32
-
-    def connect(self, dest: str, name: str, persistent: bool,
-                timeout: float | None) -> I2PSocket:
-        session = self._session(name, persistent)
-        return session.connect(dest, timeout=timeout)
 
     def open_session(self, name: str, persistent: bool) -> SamSession:
         return self._session(name, persistent)
@@ -1022,6 +1142,7 @@ class I2pdManager:
         for session in self._sessions.values():
             session.close()
         self._sessions.clear()
+        self._session_kinds.clear()
         self._terminate_process()
         self._initialised = False
 
@@ -1051,6 +1172,7 @@ class I2pdManager:
         for session in self._sessions.values():
             session.close()
         self._sessions.clear()
+        self._session_kinds.clear()
         proc = self._process
         if proc is None:
             return
@@ -1084,11 +1206,20 @@ class I2PListener:
             conn.close()
     """
 
-    def __init__(self, session: SamSession) -> None:
+    def __init__(self, session: SamSession, alive: Callable[[], bool] | None = None) -> None:
         self._session = session
+        self._alive = alive
         self.address = session.b32
 
     def accept(self, timeout: float | None = None) -> I2PSocket:
+        # Refuse to dial the SAM port once our router is gone: a dead router
+        # frees the port, and accepting from whatever binds it next would let
+        # a local process hand us spoofed "inbound" streams.
+        if self._alive is not None and not self._alive():
+            raise I2PError(
+                "i2pd is no longer running — this listener is dead. "
+                "Call basic_i2p.ensure_running() and listen() again."
+            )
         return self._session.accept(timeout=timeout)
 
     def close(self) -> None:
@@ -1281,7 +1412,12 @@ def connect(dest: str, name: str = _DEFAULT_NAME, persistent: bool = True,
     *from*. Raises if i2pd isn't running or the peer can't be reached.
     """
     with _lock:
-        return _running_manager().connect(dest, name, persistent, timeout)
+        session = _running_manager().open_session(name, persistent)
+    # Dial outside the lock: a stream connect legitimately takes tunnel-build
+    # time (up to minutes), and holding the module lock that long would block
+    # every other API call. The dial uses its own SAM connection, so it needs
+    # no shared state beyond the session id.
+    return session.connect(dest, timeout=timeout)
 
 
 def listen(name: str = _DEFAULT_NAME, persistent: bool = True) -> I2PListener:
@@ -1292,8 +1428,9 @@ def listen(name: str = _DEFAULT_NAME, persistent: bool = True) -> I2PListener:
     the address is stable across runs. Raises if i2pd isn't running.
     """
     with _lock:
-        session = _running_manager().open_session(name, persistent)
-        return I2PListener(session)
+        mgr = _running_manager()
+        session = mgr.open_session(name, persistent)
+        return I2PListener(session, alive=mgr.is_running)
 
 
 def stop() -> None:
