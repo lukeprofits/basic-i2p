@@ -690,6 +690,40 @@ def _find_or_install_i2pd() -> Path:
     return _user_binary_path()
 
 
+#: The oldest i2pd seen to run for long against today's network. Ubuntu
+#: 24.04's packaged 2.49.0 aborts about 30 seconds after every start.
+_OLDEST_GOOD_I2PD = (2, 50, 0)
+
+
+def _router_version(binary: Path | None) -> tuple[int, ...] | None:
+    """`i2pd --version`, as numbers, or None if it cannot be had."""
+    if binary is None:
+        return None
+    try:
+        out = subprocess.run(
+            [str(binary), "--version"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"i2pd version (\d+)\.(\d+)\.(\d+)", out)
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def _old_router_hint(binary: Path | None) -> str:
+    """A sentence for an error, when the router is older than any seen to
+    stay up: the likely reason it died."""
+    version = _router_version(binary)
+    if version is None or version >= _OLDEST_GOOD_I2PD:
+        return ""
+    found = ".".join(map(str, version))
+    return (
+        f" This i2pd is {found}, older than any seen to stay up on today's "
+        "network (Ubuntu 24.04 ships 2.49.0, which aborts within a minute). "
+        "Install a current one: https://repo.i2pd.xyz or, on Ubuntu, "
+        "`sudo add-apt-repository ppa:purplei2p/i2pd && sudo apt install i2pd`."
+    )
+
+
 def _ensure_exec(path: Path) -> None:
     try:
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -994,7 +1028,8 @@ class I2pdManager:
                     f"--- i2pd log tail ---\n{tail}"
                 )
             raise I2PError(
-                f"i2pd exited unexpectedly (code {self._process.returncode}):\n{tail}"
+                f"i2pd exited unexpectedly (code {self._process.returncode})."
+                f"{_old_router_hint(self._binary)}\n{tail}"
             )
 
     def _read_log_tail(self, n_bytes: int = 4096) -> str:

@@ -30,7 +30,7 @@ On **Windows** and **macOS**, the first call downloads the official i2pd binary 
 On **Linux** there is no portable official i2pd build (every release package dynamic-links distro-specific libraries), so `basic-i2p` uses a system i2pd — install it once:
 
 ```
-sudo apt install i2pd      # Debian / Ubuntu
+sudo apt install i2pd      # Debian / Ubuntu (Ubuntu 24.04: use the PPA, below)
 sudo dnf install i2pd      # Fedora
 sudo pacman -S i2pd        # Arch
 ```
@@ -150,6 +150,13 @@ The script fetches PurpleI2P's signed `SHA512SUMS` and verifies its OpenPGP sign
 **Slow first run.** First bootstrap reseeds and builds tunnels through the live I2P network — 1–5 minutes is normal. Subsequent starts reuse the cached netdb. The router data lives in `platformdirs.user_data_dir("basic_i2p")` so it survives reinstalls. To wipe it, delete that directory.
 
 **`I2PBinaryNotFound` on Linux.** Install a system i2pd (`sudo apt install i2pd`, or see the [official repo](https://repo.i2pd.xyz)). Alternatively, place an i2pd binary at the path printed in the error message and `basic-i2p` will use it.
+
+**i2pd exits within a minute of starting.** An old router: Ubuntu 24.04's packaged i2pd is 2.49.0, which aborts about 30 seconds into every start on today's network. The error names the version when this is likely. Install a current one from the i2pd project's PPA:
+
+```
+sudo add-apt-repository ppa:purplei2p/i2pd
+sudo apt update && sudo apt install i2pd
+```
 
 **`I2PDataDirLocked` on startup.** Another `basic-i2p`-using process (or a separately running i2pd) owns the data directory. Run one process per data dir — or set `basic_i2p.DATA_DIR` to a different path before starting.
 
