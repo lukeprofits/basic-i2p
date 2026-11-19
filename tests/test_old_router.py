@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import signal
+import sys
 from pathlib import Path
+from unittest import mock
+
+import pytest
 
 import basic_i2p
+
+# The fake routers are shell scripts, and Windows is never asked its version.
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
 
 
 def _router(tmp_path: Path, version: str) -> Path:
@@ -30,3 +38,20 @@ def test_a_current_router_or_none_at_all_adds_nothing(tmp_path: Path) -> None:
     silent.write_text("#!/bin/sh\necho nothing useful\n")
     silent.chmod(0o755)
     assert basic_i2p._old_router_hint(silent) == ""
+
+
+def _dead(code: int, hint: str) -> basic_i2p.I2pdManager:
+    manager = basic_i2p.I2pdManager()
+    manager._old_router = hint
+    manager._process = mock.Mock(poll=lambda: code, returncode=code)
+    manager._log_path = None
+    return manager
+
+
+def test_only_an_abort_is_blamed_on_the_version(tmp_path: Path) -> None:
+    hint = basic_i2p._old_router_hint(_router(tmp_path, "2.49.0"))
+    with pytest.raises(basic_i2p.I2PError, match="2.49.0"):
+        _dead(-signal.SIGABRT, hint)._check_alive()
+    with pytest.raises(basic_i2p.I2PError) as caught:
+        _dead(1, hint)._check_alive()  # a bad flag, a port in use: its own cause
+    assert "2.49.0" not in str(caught.value)

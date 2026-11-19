@@ -690,14 +690,19 @@ def _find_or_install_i2pd() -> Path:
     return _user_binary_path()
 
 
-#: The oldest i2pd seen to run for long against today's network. Ubuntu
-#: 24.04's packaged 2.49.0 aborts about 30 seconds after every start.
+#: Routers older than this are named as the likely cause when one aborts.
+#: Observed: Ubuntu 24.04's packaged 2.49.0 aborts (SIGABRT) about 30
+#: seconds after every start; 3.0.0 runs for days. 2.50.0 is the release
+#: after the one seen to fail -- assumed good, not observed. Move it when a
+#: version is seen either way.
 _OLDEST_GOOD_I2PD = (2, 50, 0)
 
 
 def _router_version(binary: Path | None) -> tuple[int, ...] | None:
-    """`i2pd --version`, as numbers, or None if it cannot be had."""
-    if binary is None:
+    """`i2pd --version`, as numbers, or None if it cannot be had. Not asked
+    on Windows, which always runs the pinned build and would flash a console
+    window for it."""
+    if binary is None or sys.platform == "win32":
         return None
     try:
         out = subprocess.run(
@@ -709,10 +714,9 @@ def _router_version(binary: Path | None) -> tuple[int, ...] | None:
     return tuple(int(g) for g in m.groups()) if m else None
 
 
-def _old_router_hint(binary: Path | None) -> str:
-    """A sentence for an error, when the router is older than any seen to
-    stay up: the likely reason it died."""
-    version = _router_version(binary)
+def _old_router_text(version: tuple[int, ...] | None) -> str:
+    """A sentence naming a router older than any seen to stay up, and where
+    to get a current one; empty for any other."""
     if version is None or version >= _OLDEST_GOOD_I2PD:
         return ""
     found = ".".join(map(str, version))
@@ -720,8 +724,14 @@ def _old_router_hint(binary: Path | None) -> str:
         f" This i2pd is {found}, older than any seen to stay up on today's "
         "network (Ubuntu 24.04 ships 2.49.0, which aborts within a minute). "
         "Install a current one: https://repo.i2pd.xyz or, on Ubuntu, "
-        "`sudo add-apt-repository ppa:purplei2p/i2pd && sudo apt install i2pd`."
+        "`sudo add-apt-repository ppa:purplei2p/i2pd && sudo apt update && "
+        "sudo apt install i2pd`."
     )
+
+
+def _old_router_hint(binary: Path | None) -> str:
+    """:func:`_old_router_text` for the router at `binary`."""
+    return _old_router_text(_router_version(binary))
 
 
 def _ensure_exec(path: Path) -> None:
@@ -845,6 +855,8 @@ class I2pdManager:
 
     def __init__(self) -> None:
         self._binary: Path | None = None
+        #: why a router this old may die, said when it does; empty if not old
+        self._old_router = ""
         self._data_dir: Path | None = None
         self._process: subprocess.Popen[bytes] | None = None
         self._log_path: Path | None = None
@@ -874,6 +886,11 @@ class I2pdManager:
         self._session_kinds.clear()
 
         self._binary = _find_or_install_i2pd()
+        # Asked once, before launching: a router known to abort is said up
+        # front, and named again if it does, after startup or during it.
+        self._old_router = _old_router_text(_router_version(self._binary))
+        if self._old_router:
+            logger.warning("%s", self._old_router.strip())
         self._data_dir = _get_data_dir()
         _secure_mkdir(self._data_dir, mode=0o700)
         _secure_mkdir(_keys_dir(), mode=0o700)
@@ -980,6 +997,12 @@ class I2pdManager:
                 probe.create()
                 probe.close()
                 return
+            except OSError:
+                # The router going away mid-probe surfaces as a refused or
+                # reset connection: say that it died, and why, if it did.
+                probe.close()
+                self._check_alive()
+                raise
             except SAMError as exc:
                 probe.close()
                 # DUPLICATED_ID shouldn't happen (unique id), but any transient
@@ -1027,10 +1050,11 @@ class I2pdManager:
                     f"other process or set basic_i2p.DATA_DIR to a different path.\n"
                     f"--- i2pd log tail ---\n{tail}"
                 )
-            raise I2PError(
-                f"i2pd exited unexpectedly (code {self._process.returncode})."
-                f"{_old_router_hint(self._binary)}\n{tail}"
-            )
+            code = self._process.returncode
+            # Only an abort is blamed on the version: that is the failure
+            # seen; any other exit has its own cause in the log below.
+            hint = self._old_router if code == -signal.SIGABRT else ""
+            raise I2PError(f"i2pd exited unexpectedly (code {code}).{hint}\n{tail}")
 
     def _read_log_tail(self, n_bytes: int = 4096) -> str:
         if not self._log_path or not self._log_path.exists():
