@@ -12,6 +12,7 @@ import base64
 import io
 import os as _os
 import socket as _socket
+import sys as _sys
 import tarfile
 import zipfile
 from unittest import mock
@@ -271,7 +272,8 @@ def test_extract_tar_roundtrip(tmp_path):
     _extract_tar(archive, out)
     extracted = out / "i2pd"
     assert extracted.read_bytes() == data
-    assert extracted.stat().st_mode & 0o100  # exec bit preserved
+    if _sys.platform != "win32":  # Windows has no exec bit to keep
+        assert extracted.stat().st_mode & 0o100  # exec bit preserved
 
 
 # ---------------------------------------------------------------------------
