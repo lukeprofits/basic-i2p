@@ -9,7 +9,7 @@ description = "An intentionally tiny I2P library for Python. Auto-manages the of
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Luke Profits" }]
-requires-python = ">=3.9"
+requires-python = ">=3.10"  # 3.9 is end-of-life and no longer testable on CI
 dependencies = [
     "requests>=2.28",
     "platformdirs>=3.0",
@@ -55,8 +55,7 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-# Runtime support floor is 3.9 (requires-python above); modern mypy can no
-# longer model 3.9, so type-check against the oldest version it still can.
+# The runtime floor (requires-python above): checked as the oldest it runs on.
 python_version = "3.10"
 files = ["src/basic_i2p"]
 warn_unused_ignores = true
